@@ -1,0 +1,12 @@
+*.wav
+*.flac
+*.mp3
+*.ogg
+*.bin
+*.zip
+*.gz
+*.soundforge
+*.sfresource
+.snapshot/
+_audio-site/
+protocol-app/

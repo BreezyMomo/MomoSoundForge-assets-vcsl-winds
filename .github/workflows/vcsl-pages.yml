@@ -1,0 +1,200 @@
+name: Validate and publish immutable VCSL library
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Fixed release containing the complete library snapshot
+        required: true
+        type: string
+      asset_name:
+        description: Exact ZIP attachment name
+        required: true
+        default: library.zip
+        type: string
+      asset_sha256:
+        description: SHA-256 of the immutable ZIP attachment
+        required: true
+        type: string
+      publish:
+        description: Deploy after a successful candidate of the same revision and attachment
+        required: true
+        default: false
+        type: boolean
+      candidate_run_id:
+        description: Successful publish=false run ID, required when publishing
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: audio-pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      ASSET_NAME: ${{ inputs.asset_name }}
+      ASSET_SHA256: ${{ inputs.asset_sha256 }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Check immutable release inputs
+        run: |
+          python3 - <<'PY'
+          import os, re
+          if not re.fullmatch(r'[a-f0-9]{64}', os.environ['ASSET_SHA256']):
+              raise SystemExit('An exact lowercase SHA-256 is required')
+          if not re.fullmatch(r'[A-Za-z0-9_.-]+\.zip', os.environ['ASSET_NAME']):
+              raise SystemExit('Use one exact ZIP attachment name')
+          tag = os.environ['RELEASE_TAG']
+          if not tag or tag.lower() == 'latest' or len(tag) > 200 or '\n' in tag or '\r' in tag:
+              raise SystemExit('A fixed release tag is required')
+          PY
+
+      - name: Verify the successful candidate before publishing
+        if: inputs.publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+        run: |
+          python3 - <<'PY'
+          import os, re
+          if not re.fullmatch(r'[0-9]+', os.environ['CANDIDATE_RUN_ID']):
+              raise SystemExit('Publishing requires the successful candidate run ID')
+          PY
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CANDIDATE_RUN_ID" > candidate-run.json
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CANDIDATE_RUN_ID/artifacts" > candidate-artifacts.json
+          python3 - <<'PY'
+          import json, os
+          run = json.load(open('candidate-run.json'))
+          if run.get('conclusion') != 'success' or run.get('status') != 'completed' or run.get('head_sha') != os.environ['GITHUB_SHA'] or run.get('path') != '.github/workflows/vcsl-pages.yml':
+              raise SystemExit('Candidate must succeed on the exact current source revision and workflow')
+          items = [x for x in json.load(open('candidate-artifacts.json'))['artifacts'] if x['name'] == 'library-candidate-proof' and not x['expired']]
+          if len(items) != 1:
+              raise SystemExit('The successful candidate proof is missing or expired')
+          open('candidate-artifact-id', 'w').write(str(items[0]['id']))
+          PY
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$(cat candidate-artifact-id)/zip" > candidate-proof.zip
+          python3 - <<'PY'
+          import json, os, zipfile
+          with zipfile.ZipFile('candidate-proof.zip') as archive:
+              if archive.getinfo('candidate-proof.json').file_size > 16384:
+                  raise SystemExit('Candidate proof exceeds its budget')
+              proof = json.loads(archive.read('candidate-proof.json'))
+          expected = {'schema': 'momo.library-candidate/v1', 'candidate': True, 'commit': os.environ['GITHUB_SHA'], 'releaseTag': os.environ['RELEASE_TAG'], 'assetName': os.environ['ASSET_NAME'], 'assetSha256': os.environ['ASSET_SHA256']}
+          if any(proof.get(key) != value for key, value in expected.items()):
+              raise SystemExit('Candidate proof does not match this release attachment and revision')
+          PY
+
+      - name: Check out the pinned protocol implementation
+        uses: actions/checkout@v6
+        with:
+          repository: BreezyMomo/MomoSoundForge
+          ref: 4f125e21a1f78985aff72e8dd52c5b1e2e049bbc
+          path: protocol-app
+
+      - name: Test the snapshot publisher and protocol rejection paths
+        env:
+          PROTOCOL_APP_ROOT: ${{ github.workspace }}/protocol-app
+        run: |
+          npm ci --prefix protocol-app
+          node --test tools/build-vcsl-site.test.mjs tools/validate-library.test.mjs
+
+      - name: Download and verify the fixed release attachment
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern "$ASSET_NAME" --output library.zip
+          python3 - <<'PY'
+          import hashlib, os
+          with open('library.zip', 'rb') as source:
+              actual = hashlib.file_digest(source, 'sha256').hexdigest()
+          if actual != os.environ['ASSET_SHA256']:
+              raise SystemExit('Release attachment SHA-256 mismatch')
+          PY
+
+      - name: Safely extract the complete snapshot
+        run: |
+          python3 - <<'PY'
+          import pathlib, stat, zipfile
+          with zipfile.ZipFile('library.zip') as archive:
+              items = archive.infolist()
+              if len(items) > 25000 or sum(x.file_size for x in items) >= 1073741824:
+                  raise SystemExit('Snapshot ZIP exceeds the site budget')
+              seen = set()
+              for item in items:
+                  name = item.filename.rstrip('/')
+                  parts = name.split('/')
+                  mode = item.external_attr >> 16
+                  if not name or any(x in ('', '.', '..') for x in parts) or '\\' in name or ':' in name or name.startswith('/') or any(ord(x) < 32 or ord(x) == 127 for x in name):
+                      raise SystemExit('Unsafe ZIP path')
+                  if name.casefold() in seen or item.flag_bits & 1:
+                      raise SystemExit('Duplicate or encrypted ZIP entry')
+                  seen.add(name.casefold())
+                  kind = stat.S_IFMT(mode)
+                  if kind not in (0, stat.S_IFREG, stat.S_IFDIR) or (item.is_dir() and kind == stat.S_IFREG) or (not item.is_dir() and kind == stat.S_IFDIR):
+                      raise SystemExit('ZIP symlink or special file rejected')
+              if pathlib.Path('.snapshot').exists() or pathlib.Path('.snapshot').is_symlink():
+                  raise SystemExit('Snapshot extraction directory must not already exist')
+              archive.extractall('.snapshot')
+          PY
+          node tools/build-vcsl-site.mjs --snapshot .snapshot --output _audio-site > snapshot-report.json
+
+      - name: Validate graphs, complete dependencies and every declared note range
+        run: node tools/validate-library.mjs --app-root protocol-app --site _audio-site --report validation-report.json
+
+      - name: Record the successful candidate inputs
+        if: ${{ !inputs.publish }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          proof = {'schema': 'momo.library-candidate/v1', 'candidate': True, 'commit': os.environ['GITHUB_SHA'], 'releaseTag': os.environ['RELEASE_TAG'], 'assetName': os.environ['ASSET_NAME'], 'assetSha256': os.environ['ASSET_SHA256'], 'snapshot': json.load(open('snapshot-report.json'))}
+          json.dump(proof, open('candidate-proof.json', 'w'), indent=2)
+          PY
+
+      - uses: actions/upload-artifact@v4
+        if: ${{ !inputs.publish }}
+        with:
+          name: library-candidate-proof
+          path: candidate-proof.json
+          retention-days: 30
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: library-validation
+          path: |
+            snapshot-report.json
+            validation-report.json
+
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: _audio-site
+          retention-days: 1
+
+  deploy:
+    if: inputs.publish && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/configure-pages@v5
+      - name: Deploy the verified snapshot
+        id: deployment
+        uses: actions/deploy-pages@v4
