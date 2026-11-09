@@ -114,7 +114,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern "$ASSET_NAME" --output library.zip
+          ASSET_URL=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" --jq '[.assets[] | select(.name == env.ASSET_NAME)][0].browser_download_url')
+          test -n "$ASSET_URL"
+          curl --fail --location --retry 5 --retry-all-errors --header "Authorization: Bearer $GH_TOKEN" --header "Accept: application/octet-stream" "$ASSET_URL" --output library.zip
           python3 - <<'PY'
           import hashlib, os
           with open('library.zip', 'rb') as source:
